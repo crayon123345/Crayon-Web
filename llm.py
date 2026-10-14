@@ -23,6 +23,8 @@ SYSTEM_PROMPT = (
     "```web-search\nindia vs pakistan latest result\n```\n"
     "The results come back as a message beginning with [Search results] (title, url, snippet, date). Then answer using them, "
     "say where the info is from (mention source names and include the URLs), and say if results are thin or conflicting. "
+    "Freshness: compare result dates with the time frame asked. If nothing matches it, say plainly that you could not find it "
+    "for that time frame, then give the closest dated items with their dates visible. Never present old information as if it were current. "
     "You may search again with a better query if needed, at most 3 searches per question. Do not search for things you know well. "
     "To read a page in full (an article, a product page, docs), end your reply with one block tagged web-fetch containing just the full URL:\n"
     "```web-fetch\nhttps://example.com/article\n```\n"
@@ -115,8 +117,14 @@ AGENT_PROMPT = (
 
 
 def to_messages(history, user_text, mail=False, agent=False):
+    import datetime
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-    msgs = [SystemMessage(content=SYSTEM_PROMPT + (GMAIL_PROMPT if mail else "") + (AGENT_PROMPT if agent else ""))]
+    # The model otherwise has no clock: without a date it cannot judge what
+    # "yesterday"/"latest" means and passed off year-old results as current
+    # (live failure 2026-10-15: narrated a Nov-2024 Test as "yesterday's").
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    sys_text = f"Today's date: {today} (UTC).\n\n" + SYSTEM_PROMPT + (GMAIL_PROMPT if mail else "") + (AGENT_PROMPT if agent else "")
+    msgs = [SystemMessage(content=sys_text)]
     for role, text in history:
         msgs.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))
     msgs.append(HumanMessage(content=user_text))
