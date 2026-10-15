@@ -455,6 +455,13 @@ async def fetch_page(req: Request):
     return res
 
 
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 WMO = {0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Icy fog",
        51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle", 61: "Light rain", 63: "Rain", 65: "Heavy rain",
        66: "Freezing rain", 67: "Heavy freezing rain", 71: "Light snow", 73: "Snow", 75: "Heavy snow",
@@ -482,14 +489,35 @@ async def weather(req: Request, q: str = ""):
                                      "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
                                      "timezone": "auto", "forecast_days": 3})).json()
         cur, d = w.get("current", {}), w.get("daily", {})
+        # open-meteo answers errors with an error body, not an HTTP failure
+        # ({"error": true, "reason": "..."}), and httpx does not raise on those.
+        # Treat a forecast without current/daily as a miss and fall back, or the
+        # card renders nulls as "Unknown" weather (seen live 2026-10-15).
+        if cur and d.get("time"):
+            days = []
+            for i in range(min(3, len(d.get("time", [])))):
+                days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
+                             "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
+            return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
+                    "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
+                    "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
+                    "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}
+        print("weather: open-meteo miss:", str(w.get("reason"))[:120])
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+            j1 = (await c.get("https://wttr.in/" + q, params={"format": "j1"})).json()
+        cc = (j1.get("current_condition") or [{}])[0]
         days = []
-        for i in range(min(3, len(d.get("time", [])))):
-            days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
-                         "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
+        for wd in (j1.get("weather") or [])[:3]:
+            rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
+            days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
+                         "rain": max(rain) if rain else None})
+        if not cc:
+            raise ValueError("wttr.in empty")
         return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
-                "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
-                "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
-                "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}
+                "temp": _f(cc.get("temp_C")), "feels": _f(cc.get("FeelsLikeC")),
+                "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
+                "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
+                "days": days, "source": "wttr.in"}
     except Exception as e:
         print("weather:", type(e).__name__)
         return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
