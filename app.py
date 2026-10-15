@@ -546,46 +546,69 @@ async def fx(req: Request, pair: str = ""):
 
 
 async def _stock_yahoo(sym):
+    """Returns (card, unknown). unknown=True means yahoo definitively has no such
+    ticker (HTTP 404 or empty result) - NOT an outage. Other failures raise."""
     import datetime as _dt
+    import math as _math
     async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
         r = await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})
+        if r.status_code == 404:
+            return None, True
         r.raise_for_status()
         j = r.json()
     res = (j.get("chart") or {}).get("result") or []
     if not res:
-        return None
+        return None, True
     meta = res[0].get("meta", {})
     price = meta.get("regularMarketPrice")
-    if price is None:
-        return None
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or not _math.isfinite(price) or price <= 0:
+        return None, True
     ts = meta.get("regularMarketTime")
     when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
     return {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
             "price": price, "prev": meta.get("chartPreviousClose"), "currency": meta.get("currency", ""),
             "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
-            "date": when, "source": "yahoo finance"}
+            "date": when, "source": "yahoo finance"}, False
 
 
-async def _stock_stooq(sym):
-    # Free CSV quotes, no key. US tickers need the .us suffix; symbols that
-    # already carry an exchange/index suffix go through as-is. Returns None
-    # when stooq has no quote for the symbol.
-    import csv as _csv
-    import io as _io
-    q = sym.lower() if ("." in sym or sym.startswith("^")) else sym.lower() + ".us"
+async def _stock_cnbc(sym):
+    """CNBC's free JSON quote (no key). Fallback only for PLAIN US tickers:
+    yahoo-style suffixed/index symbols (.NS, ^NSEI) are a different namespace and
+    must not be guessed here. The returned symbol must match the request exactly.
+    Live-verified 2026-10-15: known ticker -> code 0 with last/prev/name/currency;
+    unknown -> code 1."""
+    import math as _math
+    import re as _re
+    if not _re.fullmatch(r"[A-Z0-9]{1,6}", sym):
+        return None
     async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
-        r = await c.get("https://stooq.com/q/l/", params={"s": q, "f": "sd2t2ohlcv", "h": "", "e": "csv"})
+        r = await c.get("https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol",
+                        params={"symbols": sym, "requestMethod": "itv", "noform": "1",
+                                "partnerId": "2", "fund": "1", "exthrs": "1", "output": "json"})
         r.raise_for_status()
-    rows = list(_csv.DictReader(_io.StringIO(r.text)))
-    if not rows:
+        j = r.json()
+    rows = ((j.get("FormattedQuoteResult") or {}).get("FormattedQuote")) or []
+    if not rows or rows[0].get("code") != 0 or rows[0].get("symbol", "").upper() != sym:
         return None
     row = rows[0]
-    close = (row.get("Close") or "").strip()
-    if not close or close == "N/D":
+
+    def _num(v):
+        try:
+            n = float(str(v).replace(",", "").replace("+", "").replace("%", ""))
+        except (TypeError, ValueError):
+            return None
+        return n if _math.isfinite(n) else None
+
+    price = _num(row.get("last"))
+    if price is None or price <= 0:
         return None
-    when = " ".join(x for x in [(row.get("Date") or "").strip(), (row.get("Time") or "").strip()] if x)
-    return {"symbol": sym, "name": "", "price": float(close), "prev": None, "currency": "",
-            "exchange": "", "date": when, "source": "stooq"}
+    when = str(row.get("last_time") or "")[:16].replace("T", " ")
+    if not when:
+        return None
+    return {"symbol": sym, "name": str(row.get("name") or ""), "price": price,
+            "prev": _num(row.get("previous_day_closing")),
+            "currency": str(row.get("currencyCode") or ""), "exchange": str(row.get("exchange") or ""),
+            "date": when + " (as reported by CNBC)", "delayed": True, "source": "cnbc"}
 
 
 @app.get("/api/stock")
@@ -601,25 +624,26 @@ async def stock(req: Request, sym: str = ""):
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     # Same fallback discipline as /api/weather: a source outage must degrade to
-    # the next source, never straight to 503 (live failure 2026-10-15).
-    yahoo_err = False
+    # the next source, never straight to 503 (live failure 2026-10-15). A real
+    # "unknown ticker" (yahoo 404 / empty) is not an outage.
+    card, unknown, yahoo_err, cnbc_err = None, False, False, False
     try:
-        out = await _stock_yahoo(sym)
+        card, unknown = await _stock_yahoo(sym)
     except Exception as e:
         print("stock yahoo:", type(e).__name__)
-        out, yahoo_err = None, True
-    if out is None:
+        yahoo_err = True
+    if card is None:
         try:
-            out = await _stock_stooq(sym)
+            card = await _stock_cnbc(sym)
         except Exception as e:
-            print("stock stooq:", type(e).__name__)
-            out = None
-    if out is None:
-        if yahoo_err:
+            print("stock cnbc:", type(e).__name__)
+            cnbc_err = True
+    if card is None:
+        if yahoo_err or cnbc_err:
             return JSONResponse({"error": "Quotes are unavailable right now."}, status_code=503)
         return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-    _stcache[sym] = (time.time(), out)
-    return out
+    _stcache[sym] = (time.time(), card)
+    return card
 
 
 @app.get("/api/image")
