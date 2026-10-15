@@ -1,13 +1,15 @@
-"""Stock fallback (PR #5 review v2): yahoo failures degrade to CNBC's free JSON
-quote, never straight to 503 (live failure 2026-10-15). A yahoo 404/empty is an
-UNKNOWN ticker, not an outage. CNBC fallback is restricted to plain US tickers
-and binds the returned symbol to the request. Stooq was dropped: its q/l CSV
-endpoint is removed and q/d/l sits behind an anti-bot check (verified live)."""
+"""Stock endpoint (PR #5 review v3): single VERIFIED source (yahoo). No fallback
+until a source with permitting terms exists - stooq's CSV endpoint is removed /
+anti-bot-walled and CNBC's terms are internal-use-only (both verified live
+2026-10-15), so an outage is answered honestly with 503. The returned instrument
+is bound: symbol match, stock-like type, named exchange + currency, finite
+positive price, fresh timestamp; prev close is normalized before it can 500."""
 import os
 os.environ.pop("GEMINI_API_KEY", None)
 os.environ.pop("NEON_DATABASE_URL", None)
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
 
+import time
 from fastapi.testclient import TestClient
 import app as appmod
 import httpx
@@ -24,17 +26,16 @@ class _Resp:
             raise httpx.HTTPStatusError("boom", request=None, response=None)
 
 
-YH = {"chart": {"result": [{"meta": {"symbol": "AAPL", "shortName": "Apple Inc.",
-      "regularMarketPrice": 232.1, "chartPreviousClose": 230.5, "currency": "USD",
-      "fullExchangeName": "NasdaqGS", "regularMarketTime": 1760548800}}]}}
-CNBC = {"FormattedQuoteResult": {"FormattedQuote": [
-    {"symbol": "AAPL", "code": 0, "name": "Apple Inc.", "last": "344.80",
-     "previous_day_closing": "342.96", "currencyCode": "USD", "exchange": "NASDAQ",
-     "last_time": "2026-10-15T11:05:55.163-0400"}]}}
-CNBC_UNKNOWN = {"FormattedQuoteResult": {"FormattedQuote": [{"symbol": "ZZZZ", "code": 1}]}}
+def _yh(**meta):
+    base = {"symbol": "AAPL", "shortName": "Apple Inc.", "regularMarketPrice": 232.1,
+            "chartPreviousClose": 230.5, "currency": "USD", "fullExchangeName": "NasdaqGS",
+            "instrumentType": "EQUITY", "regularMarketTime": int(time.time()) - 3600,
+            "gmtoffset": -14400, "exchangeTimezoneName": "America/New_York"}
+    base.update(meta)
+    return {"chart": {"result": [{"meta": base}]}}
 
 
-def _client_factory(route):
+def _get(sym, payload=None, status=200, monkeypatch=None, raise_exc=None):
     class FakeAsyncClient:
         def __init__(self, *a, **k):
             pass
@@ -43,114 +44,77 @@ def _client_factory(route):
         async def __aexit__(self, *a):
             return False
         async def get(self, url, params=None):
-            return route(url, params or {})
-    return FakeAsyncClient
-
-
-def _get(sym, route, monkeypatch):
-    monkeypatch.setattr(httpx, "AsyncClient", _client_factory(route))
+            if raise_exc:
+                raise raise_exc
+            return _Resp(payload, status)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     appmod._stcache.clear()
+    appmod.hits.clear(); appmod.ip_day.clear(); appmod.day["n"] = 0  # our own rate limiter
     return TestClient(appmod.app).get(f"/api/stock?sym={sym}")
 
 
-def test_yahoo_ok_no_fallback(monkeypatch):
-    def route(url, params):
-        assert "yahoo" in url, "fallback must not fire when yahoo answers"
-        return _Resp(YH)
-    r = _get("AAPL", route, monkeypatch)
+def test_ok(monkeypatch):
+    r = _get("AAPL", _yh(), monkeypatch=monkeypatch)
     assert r.status_code == 200
     j = r.json()
-    assert j["source"] == "yahoo finance" and j["price"] == 232.1
+    assert j["price"] == 232.1 and j["prev"] == 230.5 and j["delayed"] is True
+    assert "America/New_York" in j["date"]
 
 
-def test_yahoo_5xx_falls_back_to_cnbc(monkeypatch):
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=503)
-        if "cnbc" in url:
-            assert params["symbols"] == "AAPL"
-            return _Resp(CNBC)
-        raise AssertionError(url)
-    r = _get("AAPL", route, monkeypatch)
-    assert r.status_code == 200
-    j = r.json()
-    assert j["source"] == "cnbc" and j["price"] == 344.8 and j["prev"] == 342.96
-    assert j["currency"] == "USD" and j["delayed"] is True
-
-
-def test_yahoo_connection_error_falls_back_to_cnbc(monkeypatch):
-    def route(url, params):
-        if "yahoo" in url:
-            raise httpx.ConnectError("down")
-        return _Resp(CNBC)
-    r = _get("AAPL", route, monkeypatch)
-    assert r.status_code == 200 and r.json()["source"] == "cnbc"
-
-
-def test_yahoo_404_plus_cnbc_unknown_is_404_not_503(monkeypatch):
-    """MUST-1 regression: yahoo 404 means UNKNOWN ticker, not an outage."""
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=404)
-        return _Resp(CNBC_UNKNOWN)
-    r = _get("ZZZZ", route, monkeypatch)
+def test_http_404_is_unknown_ticker(monkeypatch):
+    r = _get("ZZZZ", status=404, monkeypatch=monkeypatch)
     assert r.status_code == 404
 
 
-def test_yahoo_404_but_cnbc_knows_it_returns_cnbc(monkeypatch):
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=404)
-        return _Resp(CNBC)
-    r = _get("AAPL", route, monkeypatch)
-    assert r.status_code == 200 and r.json()["source"] == "cnbc"
+def test_empty_result_is_unknown(monkeypatch):
+    r = _get("ZZZZ", {"chart": {"result": []}}, monkeypatch=monkeypatch)
+    assert r.status_code == 404
 
 
-def test_both_down_is_503(monkeypatch):
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=503)
-        if "cnbc" in url:
-            return _Resp(status=500)
-        raise AssertionError(url)
-    r = _get("AAPL", route, monkeypatch)
+def test_symbol_mismatch_rejected(monkeypatch):
+    r = _get("AAPL", _yh(symbol="MSFT"), monkeypatch=monkeypatch)
+    assert r.status_code == 404
+
+
+def test_non_stock_instrument_rejected(monkeypatch):
+    for t in ("BOND", "CRYPTOCURRENCY", None):
+        r = _get("AAPL", _yh(instrumentType=t), monkeypatch=monkeypatch)
+        assert r.status_code == 404, t
+
+
+def test_missing_currency_or_exchange_rejected(monkeypatch):
+    r = _get("AAPL", _yh(currency=""), monkeypatch=monkeypatch)
+    assert r.status_code == 404
+    r = _get("AAPL", _yh(fullExchangeName="", exchangeName=""), monkeypatch=monkeypatch)
+    assert r.status_code == 404
+
+
+def test_invalid_price_rejected(monkeypatch):
+    for p in (float("nan"), float("inf"), -1, 0, True, None, "232.1"):
+        r = _get("AAPL", _yh(regularMarketPrice=p), monkeypatch=monkeypatch)
+        assert r.status_code == 404, p
+
+
+def test_nonfinite_prev_normalized_not_500(monkeypatch):
+    for p in (float("nan"), float("inf"), -5, 0, "x", None):
+        r = _get("AAPL", _yh(chartPreviousClose=p), monkeypatch=monkeypatch)
+        assert r.status_code == 200, p
+        assert r.json()["prev"] is None
+
+
+def test_stale_timestamp_is_outage(monkeypatch):
+    r = _get("AAPL", _yh(regularMarketTime=1577816000), monkeypatch=monkeypatch)  # 2020
+    assert r.status_code == 503
+    r = _get("AAPL", _yh(regularMarketTime=None), monkeypatch=monkeypatch)
     assert r.status_code == 503
 
 
-def test_yahoo_unknown_but_cnbc_down_is_503(monkeypatch):
-    """Cannot declare unknown on one source's word when the other never answered."""
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=404)
-        return _Resp(status=500)
-    r = _get("ZZZZ", route, monkeypatch)
+def test_http_error_is_503(monkeypatch):
+    for status in (429, 500, 503):
+        r = _get("AAPL", status=status, monkeypatch=monkeypatch)
+        assert r.status_code == 503, status
+
+
+def test_network_error_is_503(monkeypatch):
+    r = _get("AAPL", monkeypatch=monkeypatch, raise_exc=httpx.ConnectError("down"))
     assert r.status_code == 503
-
-
-def test_suffixed_symbol_never_goes_to_cnbc(monkeypatch):
-    """MUST-2: yahoo namespaces (.NS, ^NSEI) must not be guessed into CNBC."""
-    def route(url, params):
-        assert "cnbc" not in url, "suffixed symbol leaked into the CNBC namespace"
-        return _Resp(status=503)
-    r = _get("RELIANCE.NS", route, monkeypatch)
-    assert r.status_code == 503
-
-
-def test_cnbc_symbol_mismatch_rejected(monkeypatch):
-    bad = {"FormattedQuoteResult": {"FormattedQuote": [dict(CNBC["FormattedQuoteResult"]["FormattedQuote"][0], symbol="MSFT")]}}
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(status=503)
-        return _Resp(bad)
-    r = _get("AAPL", route, monkeypatch)
-    assert r.status_code == 503
-
-
-def test_nan_price_treated_as_unknown(monkeypatch):
-    nan_meta = {"chart": {"result": [{"meta": {"symbol": "AAPL", "regularMarketPrice": float("nan")}}]}}
-    def route(url, params):
-        if "yahoo" in url:
-            return _Resp(nan_meta)
-        return _Resp(CNBC)
-    r = _get("AAPL", route, monkeypatch)
-    assert r.status_code == 200 and r.json()["source"] == "cnbc"
