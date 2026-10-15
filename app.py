@@ -31,7 +31,7 @@ import shutil
 _S = BASE / "static"
 if not _S.exists():
     _S.mkdir()
-    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"):
+    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png", "assetlinks.json"):
         if (BASE / _n).exists():
             shutil.copy(BASE / _n, _S / _n)
 app.include_router(gmail_auth.router)

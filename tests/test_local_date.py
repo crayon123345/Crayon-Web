@@ -37,10 +37,17 @@ def test_bad_tz_falls_back_to_utc(monkeypatch):
 
 
 def test_zoneinfo_loads_real_zone():
-    # Pins the tzdata dependency: without system tz data or the tzdata package
-    # this raises and every zone silently degrades to UTC.
-    from zoneinfo import ZoneInfo
-    z = ZoneInfo("Asia/Calcutta")
+    # Pins the tzdata PACKAGE: with system tz paths disabled, only the installed
+    # tzdata wheel can satisfy this load. Without it every zone would silently
+    # degrade to UTC in production.
     import datetime as _d
-    dt = _d.datetime(2026, 10, 15, 12, 0, tzinfo=_d.timezone.utc).astimezone(z)
-    assert dt.utcoffset() == _d.timedelta(hours=5, minutes=30)
+    import zoneinfo
+    zoneinfo.reset_tzpath([])  # ignore /usr/share/zoneinfo etc.
+    zoneinfo.ZoneInfo.clear_cache()
+    try:
+        z = zoneinfo.ZoneInfo("Asia/Calcutta")  # raises if the wheel is absent
+        dt = _d.datetime(2026, 10, 15, 12, 0, tzinfo=_d.timezone.utc).astimezone(z)
+        assert dt.utcoffset() == _d.timedelta(hours=5, minutes=30)
+    finally:
+        zoneinfo.reset_tzpath()
+        zoneinfo.ZoneInfo.clear_cache()

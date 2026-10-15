@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Served assets are copied from repo root at boot (app.py) - never commit static/
+static/
