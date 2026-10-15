@@ -171,6 +171,7 @@ async def chat(req: Request):
 
     if active["n"] >= MAX_STREAMS:
         return JSONResponse({"error": "Crayon is busy right now. Try again in a few seconds."}, status_code=503)
+    tz = str(body.get("tz") or "")[:64]
     mail_on = False
     try:
         mail_on = bool(body.get("mail")) and gmail_auth.current_user(req) is not None
@@ -198,7 +199,7 @@ async def chat(req: Request):
                     mdl = llm.build_or(nm) if kind == "or" else model(nm)
                     used_model = nm
                     sent_label = False
-                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
+                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
                         if tt:
                             if not sent_label:

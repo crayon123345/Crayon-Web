@@ -197,7 +197,7 @@
     let acc = '', raf = 0, modelTag = '';
     try {
       ctl = new AbortController();
-      const r = await fetch('/api/chat', {signal: ctl.signal, method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: sid, message: text, mail: signedIn, agent: agentMode})});
+      const r = await fetch('/api/chat', {signal: ctl.signal, method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session_id: sid, message: text, mail: signedIn, agent: agentMode, tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || '')})});
       if (!r.ok) { const j = await r.json().catch(() => ({})); bub.parentElement.classList.add('err'); bub.textContent = j.error || 'Something went wrong.'; return null; }
       const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
       for (;;) {
