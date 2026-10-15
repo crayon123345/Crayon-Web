@@ -193,11 +193,13 @@ async def chat(req: Request):
             used_model = None
             steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
             last = None
+            mdl = None
             for kind, nm, lab in steps:
                 try:
                     mdl = llm.build_or(nm) if kind == "or" else model(nm)
                     used_model = nm
                     sent_label = False
+                    streamed = 0  # chars of joined output already sent to the client
                     async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
                         tt = llm.chunk_text(ch)
                         if tt:
@@ -205,7 +207,13 @@ async def chat(req: Request):
                                 sent_label = True
                                 yield f"data: {json.dumps({'m': llm.label(lab)})}\n\n"
                             out.append(tt)
-                            yield f"data: {json.dumps({'t': tt})}\n\n"
+                            buf = "".join(out)
+                            # Hold back a trailing UNCLOSED fenced block (e.g. a tool block cut
+                            # off mid-stream): it must never reach the page as raw markup.
+                            safe = buf.rfind("```") if buf.count("```") % 2 == 1 else len(buf)
+                            if safe > streamed:
+                                yield f"data: {json.dumps({'t': buf[streamed:safe]})}\n\n"
+                                streamed = safe
                     last = None
                     break
                 except Exception as e2:
@@ -216,9 +224,33 @@ async def chat(req: Request):
             if last is not None and not out:
                 raise last
             full = "".join(out).strip()
+            # One silent retry when the answer is empty or ends in a truncated fenced
+            # block (observed live 2026-10-15: raw "```web-search" markup shown to the
+            # visitor; "I got an empty answer" after a good search). Only the retry's
+            # well-formed text is used; a still-broken retry is dropped the same way.
+            # Retry is only safe when nothing has been streamed to the client yet;
+            # with a partial answer already shown, the truncated tail is just dropped.
+            if mdl is not None and ((not full) or (full.count("```") % 2 == 1 and streamed == 0)):
+                try:
+                    retry = []
+                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
+                        tt = llm.chunk_text(ch)
+                        if tt:
+                            retry.append(tt)
+                    rfull = "".join(retry).strip()
+                    if rfull and rfull.count("```") % 2 == 0:
+                        full = rfull
+                        out = retry
+                except Exception:
+                    pass
+            if full.count("```") % 2 == 1:
+                full = full[: full.rfind("```")].strip()  # drop the truncated tail entirely
             if not full:
                 yield f"data: {json.dumps({'t': 'I got an empty answer. Try rephrasing?'})}\n\n"
             else:
+                if streamed < len(full):
+                    yield f"data: {json.dumps({'t': full[streamed:]})}\n\n"
+
                 hist.append(("user", text))
                 hist.append(("ai", full))
                 del hist[:-MAX_TURNS * 2]
