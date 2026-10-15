@@ -469,6 +469,58 @@ WMO = {0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45:
        86: "Heavy snow showers", 95: "Thunderstorm", 96: "Storm with hail", 99: "Storm with heavy hail"}
 
 
+async def _weather_openmeteo(q):
+    """Returns (card, place, not_found). card None + not_found True means the
+    geocoder definitively has no such place; exceptions propagate (source down)."""
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        g = (await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})).json()
+        if not g.get("results"):
+            return None, None, True
+        p = g["results"][0]
+        w = (await c.get("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": p["latitude"], "longitude": p["longitude"],
+                                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                                 "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                                 "timezone": "auto", "forecast_days": 3})).json()
+    cur, d = w.get("current", {}), w.get("daily", {})
+    # open-meteo answers errors with an error body, not an HTTP failure
+    # ({"error": true, "reason": "..."}), and httpx does not raise on those.
+    # Treat a forecast without current/daily as a miss and fall back, or the
+    # card renders nulls as "Unknown" weather (seen live 2026-10-15).
+    if not (cur and d.get("time")):
+        print("weather: open-meteo miss:", str(w.get("reason"))[:120])
+        return None, p, False
+    days = []
+    for i in range(min(3, len(d.get("time", [])))):
+        days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
+                     "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
+    return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
+            "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
+            "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
+            "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}, p, False
+
+
+async def _weather_wttr(q, label):
+    """wttr.in resolves place names itself, so it needs no geocoder - it is both
+    the forecast fallback AND the fallback when open-meteo geocoding is down or
+    knows no such place. Returns None when wttr.in has no current conditions."""
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        j1 = (await c.get("https://wttr.in/" + q, params={"format": "j1"})).json()
+    cc = (j1.get("current_condition") or [{}])[0]
+    if not cc:
+        return None
+    days = []
+    for wd in (j1.get("weather") or [])[:3]:
+        rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
+        days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
+                     "rain": max(rain) if rain else None})
+    return {"place": label,
+            "temp": _f(cc.get("temp_C")), "feels": _f(cc.get("FeelsLikeC")),
+            "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
+            "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
+            "days": days, "source": "wttr.in"}
+
+
 @app.get("/api/weather")
 async def weather(req: Request, q: str = ""):
     q = q.strip()[:80]
@@ -477,50 +529,26 @@ async def weather(req: Request, q: str = ""):
     msg = limited(client_ip(req))
     if msg:
         return JSONResponse({"error": msg}, status_code=429)
+    card, p, not_found, om_err, wttr_err = None, None, False, False, False
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-            g = (await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})).json()
-            if not g.get("results"):
-                return JSONResponse({"error": "Place not found."}, status_code=404)
-            p = g["results"][0]
-            w = (await c.get("https://api.open-meteo.com/v1/forecast",
-                             params={"latitude": p["latitude"], "longitude": p["longitude"],
-                                     "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
-                                     "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                                     "timezone": "auto", "forecast_days": 3})).json()
-        cur, d = w.get("current", {}), w.get("daily", {})
-        # open-meteo answers errors with an error body, not an HTTP failure
-        # ({"error": true, "reason": "..."}), and httpx does not raise on those.
-        # Treat a forecast without current/daily as a miss and fall back, or the
-        # card renders nulls as "Unknown" weather (seen live 2026-10-15).
-        if cur and d.get("time"):
-            days = []
-            for i in range(min(3, len(d.get("time", [])))):
-                days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
-                             "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
-            return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
-                    "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
-                    "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
-                    "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}
-        print("weather: open-meteo miss:", str(w.get("reason"))[:120])
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-            j1 = (await c.get("https://wttr.in/" + q, params={"format": "j1"})).json()
-        cc = (j1.get("current_condition") or [{}])[0]
-        days = []
-        for wd in (j1.get("weather") or [])[:3]:
-            rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
-            days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
-                         "rain": max(rain) if rain else None})
-        if not cc:
-            raise ValueError("wttr.in empty")
-        return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
-                "temp": _f(cc.get("temp_C")), "feels": _f(cc.get("FeelsLikeC")),
-                "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
-                "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
-                "days": days, "source": "wttr.in"}
+        card, p, not_found = await _weather_openmeteo(q)
     except Exception as e:
-        print("weather:", type(e).__name__)
-        return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
+        print("weather open-meteo:", type(e).__name__)
+        om_err = True
+    if card is None:
+        label = (p.get("name", q) + (", " + p["country"] if p.get("country") else "")) if p else q
+        try:
+            card = await _weather_wttr(q, label)
+        except Exception as e:
+            print("weather wttr:", type(e).__name__)
+            wttr_err = True
+    if card is not None:
+        return card
+    # 404 only when the geocoder ran fine and found nothing AND wttr.in also
+    # has nothing; any source outage means we cannot confirm that -> 503.
+    if not_found and not wttr_err:
+        return JSONResponse({"error": "Place not found."}, status_code=404)
+    return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
 
 
 @app.get("/api/fx")
