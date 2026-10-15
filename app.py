@@ -545,6 +545,49 @@ async def fx(req: Request, pair: str = ""):
         return JSONResponse({"error": "Rates are unavailable right now."}, status_code=503)
 
 
+async def _stock_yahoo(sym):
+    import datetime as _dt
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
+        r = await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})
+        r.raise_for_status()
+        j = r.json()
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return None
+    meta = res[0].get("meta", {})
+    price = meta.get("regularMarketPrice")
+    if price is None:
+        return None
+    ts = meta.get("regularMarketTime")
+    when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
+    return {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
+            "price": price, "prev": meta.get("chartPreviousClose"), "currency": meta.get("currency", ""),
+            "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+            "date": when, "source": "yahoo finance"}
+
+
+async def _stock_stooq(sym):
+    # Free CSV quotes, no key. US tickers need the .us suffix; symbols that
+    # already carry an exchange/index suffix go through as-is. Returns None
+    # when stooq has no quote for the symbol.
+    import csv as _csv
+    import io as _io
+    q = sym.lower() if ("." in sym or sym.startswith("^")) else sym.lower() + ".us"
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
+        r = await c.get("https://stooq.com/q/l/", params={"s": q, "f": "sd2t2ohlcv", "h": "", "e": "csv"})
+        r.raise_for_status()
+    rows = list(_csv.DictReader(_io.StringIO(r.text)))
+    if not rows:
+        return None
+    row = rows[0]
+    close = (row.get("Close") or "").strip()
+    if not close or close == "N/D":
+        return None
+    when = " ".join(x for x in [(row.get("Date") or "").strip(), (row.get("Time") or "").strip()] if x)
+    return {"symbol": sym, "name": "", "price": float(close), "prev": None, "currency": "",
+            "exchange": "", "date": when, "source": "stooq"}
+
+
 @app.get("/api/stock")
 async def stock(req: Request, sym: str = ""):
     import re as _re
@@ -557,28 +600,26 @@ async def stock(req: Request, sym: str = ""):
     hit = _stcache.get(sym)
     if hit and time.time() - hit[0] < 60:
         return hit[1]
+    # Same fallback discipline as /api/weather: a source outage must degrade to
+    # the next source, never straight to 503 (live failure 2026-10-15).
+    yahoo_err = False
     try:
-        import datetime as _dt
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
-            j = (await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})).json()
-        res = (j.get("chart") or {}).get("result") or []
-        if not res:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        meta = res[0].get("meta", {})
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        ts = meta.get("regularMarketTime")
-        when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
-        out = {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
-                "price": price, "prev": meta.get("chartPreviousClose"), "currency": meta.get("currency", ""),
-                "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
-                "date": when, "source": "yahoo finance"}
-        _stcache[sym] = (time.time(), out)
-        return out
+        out = await _stock_yahoo(sym)
     except Exception as e:
-        print("stock:", type(e).__name__)
-        return JSONResponse({"error": "Quotes are unavailable right now."}, status_code=503)
+        print("stock yahoo:", type(e).__name__)
+        out, yahoo_err = None, True
+    if out is None:
+        try:
+            out = await _stock_stooq(sym)
+        except Exception as e:
+            print("stock stooq:", type(e).__name__)
+            out = None
+    if out is None:
+        if yahoo_err:
+            return JSONResponse({"error": "Quotes are unavailable right now."}, status_code=503)
+        return JSONResponse({"error": "Unknown ticker."}, status_code=404)
+    _stcache[sym] = (time.time(), out)
+    return out
 
 
 @app.get("/api/image")
