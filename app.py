@@ -470,18 +470,30 @@ WMO = {0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45:
 
 
 async def _weather_openmeteo(q):
-    """Returns (card, place, not_found). card None + not_found True means the
-    geocoder definitively has no such place; exceptions propagate (source down)."""
+    """Returns (card, place, not_found). Raises on outage. not_found is ONLY a
+    clean miss: an error body, an empty body, or an HTTP error is an OUTAGE and
+    must never be reported as 'place not found' (review 2026-10-15)."""
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        g = (await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})).json()
-        if not g.get("results"):
+        r = await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})
+        r.raise_for_status()
+        g = r.json()
+        if g.get("error"):
+            raise ValueError("geocoder error body: " + str(g.get("reason"))[:120])
+        if not g:
+            raise ValueError("geocoder empty body")
+        if "results" in g and not g["results"]:
+            return None, None, True
+        if "results" not in g:
+            # open-meteo answers a clean no-match as {"generationtime_ms": ...}
             return None, None, True
         p = g["results"][0]
-        w = (await c.get("https://api.open-meteo.com/v1/forecast",
+        rf = await c.get("https://api.open-meteo.com/v1/forecast",
                          params={"latitude": p["latitude"], "longitude": p["longitude"],
                                  "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
                                  "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                                 "timezone": "auto", "forecast_days": 3})).json()
+                                 "timezone": "auto", "forecast_days": 3})
+        rf.raise_for_status()
+        w = rf.json()
     cur, d = w.get("current", {}), w.get("daily", {})
     # open-meteo answers errors with an error body, not an HTTP failure
     # ({"error": true, "reason": "..."}), and httpx does not raise on those.
@@ -500,25 +512,57 @@ async def _weather_openmeteo(q):
             "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}, p, False
 
 
-async def _weather_wttr(q, label):
-    """wttr.in resolves place names itself, so it needs no geocoder - it is both
-    the forecast fallback AND the fallback when open-meteo geocoding is down or
-    knows no such place. Returns None when wttr.in has no current conditions."""
+async def _weather_wttr(q, p):
+    """wttr.in fallback. Returns (card, state) with state 'ok' | 'nothing' | 'outage'.
+
+    Binding rules (review 2026-10-15: wttr guessed Pays de la Loire for a
+    garbage place name and we served it labeled with the query):
+    - HTTP errors are outages, even when the body still carries data.
+    - No current_condition or no nearest_area resolution -> 'nothing'.
+    - A nearest_area with population "0" is wttr's null fallback -> 'nothing'.
+    - Readings must be finite (temp_C 'N/A' -> 'outage': answered unusably).
+    - When the geocoder DID resolve the place, wttr's nearest_area coordinates
+      must sit within ~1.5 deg of it, else wttr is answering for somewhere
+      else -> 'outage' (we cannot serve the known place).
+    - Free-text only (geocoder found nothing): the card is labeled with the
+      area wttr actually resolved, never with the raw query.
+    """
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-        j1 = (await c.get("https://wttr.in/" + q, params={"format": "j1"})).json()
+        r = await c.get("https://wttr.in/" + q, params={"format": "j1"})
+        r.raise_for_status()
+        j1 = r.json()
     cc = (j1.get("current_condition") or [{}])[0]
     if not cc:
-        return None
+        return None, "nothing"
+    na = (j1.get("nearest_area") or [{}])[0]
+    if not na or str(na.get("population") or "1") == "0":
+        return None, "nothing"
+    temp = _f(cc.get("temp_C"))
+    if temp is None:
+        return None, "outage"
+    if p is not None:
+        try:
+            off = abs(float(na.get("latitude", "")) - float(p["latitude"])) + abs(float(na.get("longitude", "")) - float(p["longitude"]))
+        except (TypeError, ValueError):
+            return None, "nothing"
+        if off > 3.0:
+            return None, "outage"
     days = []
     for wd in (j1.get("weather") or [])[:3]:
         rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
         days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
                      "rain": max(rain) if rain else None})
+    if p is not None:
+        label = p.get("name", q) + (", " + p["country"] if p.get("country") else "")
+    else:
+        area = (na.get("areaName") or [{}])[0].get("value", "").strip()
+        country = (na.get("country") or [{}])[0].get("value", "").strip()
+        label = (area + (", " + country if country else "")) or q
     return {"place": label,
-            "temp": _f(cc.get("temp_C")), "feels": _f(cc.get("FeelsLikeC")),
+            "temp": temp, "feels": _f(cc.get("FeelsLikeC")),
             "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
             "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
-            "days": days, "source": "wttr.in"}
+            "days": days, "source": "wttr.in"}, "ok"
 
 
 @app.get("/api/weather")
@@ -529,24 +573,25 @@ async def weather(req: Request, q: str = ""):
     msg = limited(client_ip(req))
     if msg:
         return JSONResponse({"error": msg}, status_code=429)
-    card, p, not_found, om_err, wttr_err = None, None, False, False, False
+    card, p, not_found, outage = None, None, False, False
     try:
         card, p, not_found = await _weather_openmeteo(q)
     except Exception as e:
         print("weather open-meteo:", type(e).__name__)
-        om_err = True
+        outage = True
     if card is None:
-        label = (p.get("name", q) + (", " + p["country"] if p.get("country") else "")) if p else q
         try:
-            card = await _weather_wttr(q, label)
+            card, state = await _weather_wttr(q, p)
+            if state == "outage":
+                outage = True
         except Exception as e:
             print("weather wttr:", type(e).__name__)
-            wttr_err = True
+            outage = True
     if card is not None:
         return card
-    # 404 only when the geocoder ran fine and found nothing AND wttr.in also
-    # has nothing; any source outage means we cannot confirm that -> 503.
-    if not_found and not wttr_err:
+    # 404 only on a CLEAN geocoder miss with wttr.in also having nothing; any
+    # outage, or a known place we simply cannot serve, is a 503.
+    if not outage and not_found:
         return JSONResponse({"error": "Place not found."}, status_code=404)
     return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
 
