@@ -241,6 +241,12 @@ async def chat(req: Request):
                     if rfull and rfull.count("```") % 2 == 0:
                         full = rfull
                         out = retry
+                        # Retry replaces the WHOLE answer. Anything streamed so far
+                        # was either nothing (unclosed-block holdback) or blank
+                        # (whitespace-only buffer, which is why we are retrying),
+                        # so the retry text must stream from position 0 - otherwise
+                        # the client keeps the blank and only sees full[streamed:].
+                        streamed = 0
                 except Exception:
                     pass
             if full.count("```") % 2 == 1:

@@ -106,3 +106,25 @@ def test_system_prompt_forbids_fake_future_actions():
     s = llm.to_messages([], "hi")[0].content
     assert "NO reminder" in s
     assert "NEVER promise a future or deferred action" in s
+
+
+def test_whitespace_first_reply_retry_streams_full_text(monkeypatch):
+    """Review find: a whitespace-only first reply streamed a blank to the client,
+    then the retry's "ok" would have yielded only full[1:] = "k" because the old
+    streamed offset was kept against the new text. The retry must stream whole."""
+    fake = _FakeModel([
+        [" ", "  "],                    # whitespace-only: renders blank, triggers retry
+        ["Here is the real answer."],   # retry
+    ])
+    texts = _sse_texts(_post(fake, monkeypatch))
+    assert fake.calls == 2
+    assert "".join(texts).strip() == "Here is the real answer."
+    assert any(t.strip() == "Here is the real answer." for t in texts)
+
+
+def test_email_honesty_scoped_to_gmail_state():
+    no_mail = llm.to_messages([], "hi", mail=False)[0].content
+    assert "no Gmail connected" in no_mail
+    with_mail = llm.to_messages([], "hi", mail=True)[0].content
+    assert "never say you cannot do email" in with_mail
+    assert "no Gmail connected" not in with_mail
