@@ -121,17 +121,28 @@ AGENT_PROMPT = (
 )
 
 
-def to_messages(history, user_text, mail=False, agent=False):
-    import datetime
+import datetime
+
+
+def to_messages(history, user_text, mail=False, agent=False, tz=""):
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
     # The model otherwise has no clock: without a date it cannot judge what
     # "yesterday"/"latest" means and passed off year-old results as current
     # (live failure 2026-10-15: narrated a Nov-2024 Test as "yesterday's").
-    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    # The date must be the VISITOR's local date: between 00:00-05:30 IST a UTC
+    # clock still says "yesterday" and mis-anchors every relative date word.
+    try:
+        from zoneinfo import ZoneInfo
+        z = ZoneInfo(tz) if tz else datetime.timezone.utc
+    except Exception:
+        z = datetime.timezone.utc
+    now = datetime.datetime.now(z)
+    label = tz if tz and now.tzinfo is not datetime.timezone.utc else "UTC"
+    today = now.strftime("%Y-%m-%d (%A)")
     email_rule = ("Email: the visitor HAS connected Gmail - reading, summarizing, drafting and sending their email IS available, "
                   "never say you cannot do email. " if mail else
                   "Email: you cannot read or send email (no Gmail connected); if asked, say that ability is not connected yet. ")
-    sys_text = f"Today's date: {today} (UTC).\n\n" + SYSTEM_PROMPT + email_rule + (GMAIL_PROMPT if mail else "") + (AGENT_PROMPT if agent else "")
+    sys_text = f"Today's date: {today} ({label}).\n\n" + SYSTEM_PROMPT + email_rule + (GMAIL_PROMPT if mail else "") + (AGENT_PROMPT if agent else "")
     msgs = [SystemMessage(content=sys_text)]
     for role, text in history:
         msgs.append(HumanMessage(content=text) if role == "user" else AIMessage(content=text))

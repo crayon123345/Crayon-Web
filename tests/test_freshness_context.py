@@ -7,7 +7,7 @@ import llm
 
 
 def test_system_message_carries_todays_utc_date():
-    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d (%A)")
     msgs = llm.to_messages([], "hi")
     assert f"Today's date: {today} (UTC)." in msgs[0].content
 

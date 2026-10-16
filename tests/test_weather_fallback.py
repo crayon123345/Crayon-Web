@@ -13,8 +13,11 @@ import httpx
 class _Resp:
     def __init__(self, payload):
         self._p = payload
+        self.status_code = 200
     def json(self):
         return self._p
+    def raise_for_status(self):
+        pass
 
 
 def _client_factory(route):
@@ -36,7 +39,9 @@ OM_OK = {"current": {"temperature_2m": 27.1, "apparent_temperature": 29.0,
                      "relative_humidity_2m": 71, "weather_code": 0, "wind_speed_10m": 7.2},
          "daily": {"time": ["2026-10-15"], "temperature_2m_max": [34.0],
                    "temperature_2m_min": [26.0], "precipitation_probability_max": [18]}}
-WTTR = {"current_condition": [{"temp_C": "27", "FeelsLikeC": "29", "humidity": "71",
+WTTR = {"nearest_area": [{"areaName": [{"value": "Kolkata"}], "country": [{"value": "India"}],
+                          "latitude": "22.57", "longitude": "88.36", "population": "5000000"}],
+        "current_condition": [{"temp_C": "27", "FeelsLikeC": "29", "humidity": "71",
                                "windspeedKmph": "7", "weatherDesc": [{"value": "Clear "}]}],
         "weather": [{"date": "2026-10-15", "maxtempC": "34", "mintempC": "26",
                      "hourly": [{"chanceofrain": "18"}]}]}
