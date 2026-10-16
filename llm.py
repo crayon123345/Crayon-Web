@@ -186,15 +186,57 @@ def build_groq(name: str):
                       streaming=True, temperature=0.4, timeout=60, max_retries=0)
 
 
-def plan(text: str):
+# Models that hard-failed (bad/decommissioned ID) cool down here so one bad
+# entry costs one failed request, not one per visitor message. In-memory only:
+# a restart clears it, which is also how a fixed model ID gets retried.
+_FAILED_MODELS: dict = {}
+MODEL_COOLDOWN_S = 600
+
+
+def mark_model_bad(name: str):
+    import time as _t
+    if name:
+        _FAILED_MODELS[name] = _t.monotonic()
+
+
+def model_cooling(name: str) -> bool:
+    import time as _t
+    return bool(name) and (_t.monotonic() - _FAILED_MODELS.get(name, 0)) < MODEL_COOLDOWN_S
+
+
+_HARD_MODEL_MARKERS = ("model_not_found", "does not exist", "no such model", "invalid model",
+                       "decommissioned", "unknown model", "not found")
+
+
+def hard_model_error(exc) -> bool:
+    """True for permanent model-ID errors (worth a cooldown), False for transient 429/5xx."""
+    msg = (str(exc) or "").lower()
+    return any(m in msg for m in _HARD_MODEL_MARKERS)
+
+
+def redact(text: str) -> str:
+    """Strip any configured provider key from a log line."""
+    out = text
+    for env in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"):
+        val = os.environ.get(env, "")
+        if val:
+            out = out.replace(val, "***")
+    return out
+
+
+def plan(text: str, mail: bool = False):
     """Ordered list of (kind, name, label). Gemini default; Groq free tier is the next fallback;
-    code/reasoning prefers OpenRouter; OpenRouter :free (tightest quota) stays last resort."""
+    code/reasoning prefers OpenRouter; OpenRouter :free (tightest quota) stays last resort.
+    mail=True (Gmail mode) excludes the Groq leg: visitor email content must not go to a
+    third-party processor the owner has not approved for mail. Models in cooldown are skipped."""
     gem = [("gemini", n, n) for n in model_names()]
     orm = [("or", n, n) for n in code_models()] if or_key() else []
-    grq = [("groq", n, n) for n in groq_models()] if groq_key() else []
+    grq = [] if mail else [("groq", n, n) for n in groq_models()] if groq_key() else []
     if orm and CODE_HINT.search(text or ""):
-        return orm + gem + grq
-    return gem + grq + orm
+        steps = orm + gem + grq
+    else:
+        steps = gem + grq + orm
+    return [s for s in steps if not model_cooling(s[1])]
 
 
 def label(name: str) -> str:

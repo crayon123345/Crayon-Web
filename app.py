@@ -191,7 +191,7 @@ async def chat(req: Request):
         active["n"] += 1
         try:
             used_model = None
-            steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
+            steps = llm.plan(text, mail=mail_on) if llm.provider() == "gemini" else [("gemini", None, "default")]
             last = None
             for kind, nm, lab in steps:
                 try:
@@ -206,11 +206,15 @@ async def chat(req: Request):
                                 yield f"data: {json.dumps({'m': llm.label(lab)})}\n\n"
                             out.append(tt)
                             yield f"data: {json.dumps({'t': tt})}\n\n"
+                    if not out:
+                        raise RuntimeError("empty stream from " + str(nm))
                     last = None
                     break
                 except Exception as e2:
                     last = e2
                     print("model fail:", kind, nm, type(e2).__name__)
+                    if llm.hard_model_error(e2):
+                        llm.mark_model_bad(nm)
                     if out:
                         break
             if last is not None and not out:
@@ -226,7 +230,7 @@ async def chat(req: Request):
                 await asyncio.to_thread(memory.save_chat_turn, vid, sid, text, full)
                 asyncio.create_task(asyncio.to_thread(memory.event, vid, "model:" + str(used_model)))
         except Exception as e:  # never leak keys or internals
-            print("llm error:", type(e).__name__, str(e)[:200].replace(os.environ.get("GEMINI_API_KEY", "#"), "***"))
+            print("llm error:", type(e).__name__, llm.redact(str(e)[:400]))
             yield f"data: {json.dumps({'err': 'Crayon hit a snag talking to its brain. Please try again in a moment.'})}\n\n"
         finally:
             active["n"] = max(0, active["n"] - 1)

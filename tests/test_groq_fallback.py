@@ -70,3 +70,45 @@ def test_build_groq_uses_groq_endpoint(monkeypatch):
     assert captured["base_url"] == "https://api.groq.com/openai/v1"
     assert captured["model"] == "openai/gpt-oss-120b"
     assert captured["api_key"] == "gsk_test"
+
+
+def test_mail_mode_excludes_groq_leg(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    kinds = [k for k, _, _ in llm.plan("summarize my inbox", mail=True)]
+    assert "groq" not in kinds
+    assert kinds[0] == "gemini"
+    assert "or" in kinds  # OpenRouter leg predates this PR and stays
+
+
+def test_cooling_model_is_skipped(monkeypatch):
+    _clear(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    bad = llm.groq_models()[0]
+    llm.mark_model_bad(bad)
+    try:
+        assert llm.model_cooling(bad)
+        names = [n for _, n, _ in llm.plan("hello")]
+        assert bad not in names
+        # other groq model still present
+        assert llm.groq_models()[1] in names
+    finally:
+        llm._FAILED_MODELS.clear()
+
+
+def test_hard_model_error_detection():
+    assert llm.hard_model_error(Exception("Error code: 404 - model_not_found: decommissioned"))
+    assert llm.hard_model_error(Exception("The model `x` does not exist"))
+    assert not llm.hard_model_error(Exception("429 rate limit exceeded"))
+    assert not llm.hard_model_error(Exception("500 internal server error"))
+
+
+def test_redact_strips_all_provider_keys(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-secret")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret")
+    out = llm.redact("failed gem-secret then groq-secret then or-secret")
+    assert "secret" not in out.replace("or-secret", "")
+    assert "gem-secret" not in out and "groq-secret" not in out and "or-secret" not in out
+    assert out.count("***") == 3

@@ -79,11 +79,15 @@ def register():
                             tt = llm.chunk_text(ch)
                             if tt:
                                 out.append(tt)
+                        if not out:
+                            raise RuntimeError("empty stream from " + str(nm))
                         last = None
                         break
                     except Exception as e2:
                         last = e2
                         print("discord model fail:", type(e2).__name__)
+                        if llm.hard_model_error(e2):
+                            llm.mark_model_bad(nm)
                         if out:
                             break
                 if last is not None and not out:
