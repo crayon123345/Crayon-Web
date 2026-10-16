@@ -82,3 +82,27 @@ def test_transient_error_does_not_cool_down(monkeypatch):
     r = _post(app)
     assert r.status_code == 200
     assert not llm.model_cooling("g1")
+
+
+def test_last_step_empty_still_gets_retry(monkeypatch):
+    """Reconciliation of #4 retry and #8 fallthrough: an empty stream falls
+    through while a next step exists, but the LAST step's empty stream goes
+    to the silent same-model retry instead of dying as a snag."""
+    class ScriptModel:
+        def __init__(self, scripts):
+            self.scripts = list(scripts)
+            self.calls = 0
+        async def astream(self, msgs):
+            self.calls += 1
+            for piece in self.scripts.pop(0) if self.scripts else []:
+                yield _Chunk(piece)
+
+    g1 = ScriptModel([[]])                       # empty -> must fall through
+    q1 = ScriptModel([[], ["recovered"]])
+    steps = [("gemini", "g1", "g1"), ("groq", "q1", "q1")]
+    app = _patch(monkeypatch, steps, {"g1": g1, "q1": q1})
+    r = _post(app)
+    assert r.status_code == 200
+    assert g1.calls == 1          # no retry on the non-last empty step
+    assert q1.calls == 2          # last step empty -> silent retry once
+    assert "recovered" in r.text
