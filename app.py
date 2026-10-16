@@ -31,7 +31,7 @@ import shutil
 _S = BASE / "static"
 if not _S.exists():
     _S.mkdir()
-    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"):
+    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png", "assetlinks.json"):
         if (BASE / _n).exists():
             shutil.copy(BASE / _n, _S / _n)
 app.include_router(gmail_auth.router)
@@ -171,6 +171,7 @@ async def chat(req: Request):
 
     if active["n"] >= MAX_STREAMS:
         return JSONResponse({"error": "Crayon is busy right now. Try again in a few seconds."}, status_code=503)
+    tz = str(body.get("tz") or "")[:64]
     mail_on = False
     try:
         mail_on = bool(body.get("mail")) and gmail_auth.current_user(req) is not None
@@ -198,7 +199,7 @@ async def chat(req: Request):
                     mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else model(nm)
                     used_model = nm
                     sent_label = False
-                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
+                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
                         if tt:
                             if not sent_label:
@@ -473,6 +474,102 @@ WMO = {0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast", 45:
        86: "Heavy snow showers", 95: "Thunderstorm", 96: "Storm with hail", 99: "Storm with heavy hail"}
 
 
+async def _weather_openmeteo(q):
+    """Returns (card, place, not_found). Raises on outage. not_found is ONLY a
+    clean miss: an error body, an empty body, or an HTTP error is an OUTAGE and
+    must never be reported as 'place not found' (review 2026-10-15)."""
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        r = await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})
+        r.raise_for_status()
+        g = r.json()
+        if g.get("error"):
+            raise ValueError("geocoder error body: " + str(g.get("reason"))[:120])
+        if not g:
+            raise ValueError("geocoder empty body")
+        if "results" in g and not g["results"]:
+            return None, None, True
+        if "results" not in g:
+            # open-meteo answers a clean no-match as {"generationtime_ms": ...}
+            return None, None, True
+        p = g["results"][0]
+        rf = await c.get("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": p["latitude"], "longitude": p["longitude"],
+                                 "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                                 "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                                 "timezone": "auto", "forecast_days": 3})
+        rf.raise_for_status()
+        w = rf.json()
+    cur, d = w.get("current", {}), w.get("daily", {})
+    # open-meteo answers errors with an error body, not an HTTP failure
+    # ({"error": true, "reason": "..."}), and httpx does not raise on those.
+    # Treat a forecast without current/daily as a miss and fall back, or the
+    # card renders nulls as "Unknown" weather (seen live 2026-10-15).
+    if not (cur and d.get("time")):
+        print("weather: open-meteo miss:", str(w.get("reason"))[:120])
+        return None, p, False
+    days = []
+    for i in range(min(3, len(d.get("time", [])))):
+        days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
+                     "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
+    return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
+            "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
+            "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
+            "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}, p, False
+
+
+async def _weather_wttr(q, p):
+    """wttr.in fallback. Returns (card, state) with state 'ok' | 'nothing' | 'outage'.
+
+    Binding rules (review 2026-10-15: wttr guessed Pays de la Loire for a
+    garbage place name and we served it labeled with the query):
+    - HTTP errors are outages, even when the body still carries data.
+    - No current_condition or no nearest_area resolution -> 'nothing'.
+    - A nearest_area with population "0" is wttr's null fallback -> 'nothing'.
+    - Readings must be finite (temp_C 'N/A' -> 'outage': answered unusably).
+    - When the geocoder DID resolve the place, wttr's nearest_area coordinates
+      must sit within ~1.5 deg of it, else wttr is answering for somewhere
+      else -> 'outage' (we cannot serve the known place).
+    - Free-text only (geocoder found nothing): the card is labeled with the
+      area wttr actually resolved, never with the raw query.
+    """
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        r = await c.get("https://wttr.in/" + q, params={"format": "j1"})
+        r.raise_for_status()
+        j1 = r.json()
+    cc = (j1.get("current_condition") or [{}])[0]
+    if not cc:
+        return None, "nothing"
+    na = (j1.get("nearest_area") or [{}])[0]
+    if not na or str(na.get("population") or "1") == "0":
+        return None, "nothing"
+    temp = _f(cc.get("temp_C"))
+    if temp is None:
+        return None, "outage"
+    if p is not None:
+        try:
+            off = abs(float(na.get("latitude", "")) - float(p["latitude"])) + abs(float(na.get("longitude", "")) - float(p["longitude"]))
+        except (TypeError, ValueError):
+            return None, "nothing"
+        if off > 3.0:
+            return None, "outage"
+    days = []
+    for wd in (j1.get("weather") or [])[:3]:
+        rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
+        days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
+                     "rain": max(rain) if rain else None})
+    if p is not None:
+        label = p.get("name", q) + (", " + p["country"] if p.get("country") else "")
+    else:
+        area = (na.get("areaName") or [{}])[0].get("value", "").strip()
+        country = (na.get("country") or [{}])[0].get("value", "").strip()
+        label = (area + (", " + country if country else "")) or q
+    return {"place": label,
+            "temp": temp, "feels": _f(cc.get("FeelsLikeC")),
+            "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
+            "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
+            "days": days, "source": "wttr.in"}, "ok"
+
+
 @app.get("/api/weather")
 async def weather(req: Request, q: str = ""):
     q = q.strip()[:80]
@@ -481,50 +578,27 @@ async def weather(req: Request, q: str = ""):
     msg = limited(client_ip(req))
     if msg:
         return JSONResponse({"error": msg}, status_code=429)
+    card, p, not_found, outage = None, None, False, False
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-            g = (await c.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": q, "count": 1, "language": "en"})).json()
-            if not g.get("results"):
-                return JSONResponse({"error": "Place not found."}, status_code=404)
-            p = g["results"][0]
-            w = (await c.get("https://api.open-meteo.com/v1/forecast",
-                             params={"latitude": p["latitude"], "longitude": p["longitude"],
-                                     "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
-                                     "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-                                     "timezone": "auto", "forecast_days": 3})).json()
-        cur, d = w.get("current", {}), w.get("daily", {})
-        # open-meteo answers errors with an error body, not an HTTP failure
-        # ({"error": true, "reason": "..."}), and httpx does not raise on those.
-        # Treat a forecast without current/daily as a miss and fall back, or the
-        # card renders nulls as "Unknown" weather (seen live 2026-10-15).
-        if cur and d.get("time"):
-            days = []
-            for i in range(min(3, len(d.get("time", [])))):
-                days.append({"date": d["time"][i], "max": d["temperature_2m_max"][i], "min": d["temperature_2m_min"][i],
-                             "rain": (d.get("precipitation_probability_max") or [None] * 3)[i]})
-            return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
-                    "temp": cur.get("temperature_2m"), "feels": cur.get("apparent_temperature"),
-                    "humidity": cur.get("relative_humidity_2m"), "wind": cur.get("wind_speed_10m"),
-                    "cond": WMO.get(cur.get("weather_code"), "Unknown"), "days": days, "source": "open-meteo.com"}
-        print("weather: open-meteo miss:", str(w.get("reason"))[:120])
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
-            j1 = (await c.get("https://wttr.in/" + q, params={"format": "j1"})).json()
-        cc = (j1.get("current_condition") or [{}])[0]
-        days = []
-        for wd in (j1.get("weather") or [])[:3]:
-            rain = [int(h.get("chanceofrain", 0)) for h in wd.get("hourly", []) if str(h.get("chanceofrain", "")).isdigit()]
-            days.append({"date": wd.get("date"), "max": _f(wd.get("maxtempC")), "min": _f(wd.get("mintempC")),
-                         "rain": max(rain) if rain else None})
-        if not cc:
-            raise ValueError("wttr.in empty")
-        return {"place": p.get("name", q) + (", " + p["country"] if p.get("country") else ""),
-                "temp": _f(cc.get("temp_C")), "feels": _f(cc.get("FeelsLikeC")),
-                "humidity": _f(cc.get("humidity")), "wind": _f(cc.get("windspeedKmph")),
-                "cond": (cc.get("weatherDesc") or [{}])[0].get("value", "Unknown").strip() or "Unknown",
-                "days": days, "source": "wttr.in"}
+        card, p, not_found = await _weather_openmeteo(q)
     except Exception as e:
-        print("weather:", type(e).__name__)
-        return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
+        print("weather open-meteo:", type(e).__name__)
+        outage = True
+    if card is None:
+        try:
+            card, state = await _weather_wttr(q, p)
+            if state == "outage":
+                outage = True
+        except Exception as e:
+            print("weather wttr:", type(e).__name__)
+            outage = True
+    if card is not None:
+        return card
+    # 404 only on a CLEAN geocoder miss with wttr.in also having nothing; any
+    # outage, or a known place we simply cannot serve, is a 503.
+    if not outage and not_found:
+        return JSONResponse({"error": "Place not found."}, status_code=404)
+    return JSONResponse({"error": "Weather is unavailable right now."}, status_code=503)
 
 
 @app.get("/api/fx")
@@ -549,6 +623,59 @@ async def fx(req: Request, pair: str = ""):
         return JSONResponse({"error": "Rates are unavailable right now."}, status_code=503)
 
 
+async def _stock_yahoo(sym):
+    """Single verified source. Returns (card, unknown): unknown=True means yahoo
+    definitively has no such ticker (HTTP 404, empty result, wrong/mismatched
+    instrument, unusable price) - NOT an outage. Raises on outage, including a
+    stale or missing quote timestamp (review 2026-10-15 v2).
+
+    Fallback history: stooq's q/l CSV endpoint is removed and q/d/l sits behind
+    a JS anti-bot check (verified live); CNBC's free JSON works but its market
+    data terms are internal-use-only / no republication, so it cannot back a
+    public site. Until a source with permitting terms is wired in, an outage is
+    answered honestly with 503."""
+    import datetime as _dt
+    import math as _math
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
+        r = await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})
+        if r.status_code == 404:
+            return None, True
+        r.raise_for_status()
+        j = r.json()
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return None, True
+    meta = res[0].get("meta", {})
+    # Binding: the instrument returned must be the one asked for, a
+    # stock-like security, on a named exchange with a named currency.
+    if str(meta.get("symbol", "")).upper() != sym:
+        return None, True
+    if meta.get("instrumentType") not in ("EQUITY", "ETF", "INDEX", "MUTUALFUND"):
+        return None, True
+    if not meta.get("currency") or not (meta.get("fullExchangeName") or meta.get("exchangeName")):
+        return None, True
+    price = meta.get("regularMarketPrice")
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or not _math.isfinite(price) or price <= 0:
+        return None, True
+    ts = meta.get("regularMarketTime")
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    if not isinstance(ts, (int, float)) or not (now - 45 * 86400) < ts < now + 86400:
+        raise ValueError("stale or missing quote timestamp")
+    tzname = meta.get("exchangeTimezoneName") or ""
+    off = meta.get("gmtoffset")
+    if isinstance(off, (int, float)) and tzname:
+        when = _dt.datetime.utcfromtimestamp(ts + off).strftime("%Y-%m-%d %H:%M") + " " + tzname
+    else:
+        when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
+    prev = meta.get("chartPreviousClose")
+    if not isinstance(prev, (int, float)) or isinstance(prev, bool) or not _math.isfinite(prev) or prev <= 0:
+        prev = None  # never let a NaN/Inf close reach the JSON encoder or the card
+    return {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
+            "price": price, "prev": prev, "currency": meta.get("currency", ""),
+            "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+            "date": when, "delayed": True, "source": "yahoo finance"}, False
+
+
 @app.get("/api/stock")
 async def stock(req: Request, sym: str = ""):
     import re as _re
@@ -562,27 +689,14 @@ async def stock(req: Request, sym: str = ""):
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     try:
-        import datetime as _dt
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
-            j = (await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})).json()
-        res = (j.get("chart") or {}).get("result") or []
-        if not res:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        meta = res[0].get("meta", {})
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        ts = meta.get("regularMarketTime")
-        when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
-        out = {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
-                "price": price, "prev": meta.get("chartPreviousClose"), "currency": meta.get("currency", ""),
-                "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
-                "date": when, "source": "yahoo finance"}
-        _stcache[sym] = (time.time(), out)
-        return out
+        card, unknown = await _stock_yahoo(sym)
     except Exception as e:
-        print("stock:", type(e).__name__)
+        print("stock yahoo:", type(e).__name__)
         return JSONResponse({"error": "Quotes are unavailable right now."}, status_code=503)
+    if card is None:
+        return JSONResponse({"error": "Unknown ticker."}, status_code=404)
+    _stcache[sym] = (time.time(), card)
+    return card
 
 
 @app.get("/api/image")
