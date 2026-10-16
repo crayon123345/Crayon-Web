@@ -201,11 +201,15 @@ def mark_model_bad(name: str):
 
 def model_cooling(name: str) -> bool:
     import time as _t
-    return bool(name) and (_t.monotonic() - _FAILED_MODELS.get(name, 0)) < MODEL_COOLDOWN_S
+    failed_at = _FAILED_MODELS.get(name)
+    # None check matters: monotonic() starts near 0 at boot, so a default of 0
+    # would mark every model cooling for the first 600s of host uptime
+    # (reproduced in a fresh container at ~80s uptime).
+    return failed_at is not None and (_t.monotonic() - failed_at) < MODEL_COOLDOWN_S
 
 
-_HARD_MODEL_MARKERS = ("model_not_found", "does not exist", "no such model", "invalid model",
-                       "decommissioned", "unknown model", "not found")
+_HARD_MODEL_MARKERS = ("model_not_found", "model not found", "does not exist", "no such model",
+                       "invalid model", "decommissioned", "unknown model")
 
 
 def hard_model_error(exc) -> bool:

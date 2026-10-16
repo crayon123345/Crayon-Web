@@ -63,11 +63,13 @@ async def think(history, text):
     last = None
     for kind, nm, lab in llm.plan(text):
         try:
-            mdl = llm.build_or(nm) if kind == "or" else A.model(nm)
+            mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else A.model(nm)
             r = await mdl.ainvoke(msgs)
             return llm.chunk_text(r) if not isinstance(r.content, str) else r.content
         except Exception as e:
             last = e
+            if llm.hard_model_error(e):
+                llm.mark_model_bad(nm)
     raise last
 
 

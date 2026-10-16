@@ -100,8 +100,31 @@ def test_cooling_model_is_skipped(monkeypatch):
 def test_hard_model_error_detection():
     assert llm.hard_model_error(Exception("Error code: 404 - model_not_found: decommissioned"))
     assert llm.hard_model_error(Exception("The model `x` does not exist"))
+    assert llm.hard_model_error(Exception("404: model not found"))
     assert not llm.hard_model_error(Exception("429 rate limit exceeded"))
     assert not llm.hard_model_error(Exception("500 internal server error"))
+    # bare "not found" is NOT enough: a generic 404 (endpoint/route issue)
+    # must not cool a healthy model for 10 minutes
+    assert not llm.hard_model_error(Exception("404 page not found"))
+
+
+def test_low_uptime_does_not_mark_unfailed_models_cooling(monkeypatch):
+    """Fresh containers (Render restarts) have monotonic() near 0: with the old
+    .get(name, 0) default every model looked cooling and plan() returned []."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setattr("time.monotonic", lambda: 80.0)
+    llm._FAILED_MODELS.clear()
+    assert not llm.model_cooling("openai/gpt-oss-120b")
+    steps = llm.plan("hello")
+    assert steps, "plan() must not be empty on a low-uptime host"
+    # and a genuinely failed model still cools under low uptime
+    llm.mark_model_bad("openai/gpt-oss-120b")
+    try:
+        assert llm.model_cooling("openai/gpt-oss-120b")
+    finally:
+        llm._FAILED_MODELS.clear()
 
 
 def test_redact_strips_all_provider_keys(monkeypatch):
