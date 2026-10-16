@@ -192,13 +192,15 @@ async def chat(req: Request):
         active["n"] += 1
         try:
             used_model = None
-            steps = llm.plan(text) if llm.provider() == "gemini" else [("gemini", None, "default")]
+            steps = llm.plan(text, mail=mail_on) if llm.provider() == "gemini" else [("gemini", None, "default")]
             last = None
             mdl = None
-            for kind, nm, lab in steps:
+            used_idx = -1
+            for si, (kind, nm, lab) in enumerate(steps):
                 try:
-                    mdl = llm.build_or(nm) if kind == "or" else model(nm)
+                    mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else model(nm)
                     used_model = nm
+                    used_idx = si
                     sent_label = False
                     streamed = 0  # chars of joined output already sent to the client
                     async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
@@ -215,11 +217,18 @@ async def chat(req: Request):
                             if safe > streamed:
                                 yield f"data: {json.dumps({'t': buf[streamed:safe]})}\n\n"
                                 streamed = safe
+                    if not out and si < len(steps) - 1:
+                        # Empty stream: fall through to the next provider rather than
+                        # retrying a silently-failing one. On the LAST step there is no
+                        # next provider, so fall through to the silent retry below (#4).
+                        raise RuntimeError("empty stream from " + str(nm))
                     last = None
                     break
                 except Exception as e2:
                     last = e2
                     print("model fail:", kind, nm, type(e2).__name__)
+                    if llm.hard_model_error(e2):
+                        llm.mark_model_bad(nm)
                     if out:
                         break
             if last is not None and not out:
@@ -231,15 +240,33 @@ async def chat(req: Request):
             # well-formed text is used; a still-broken retry is dropped the same way.
             # Retry is only safe when nothing has been streamed to the client yet;
             # with a partial answer already shown, the truncated tail is just dropped.
-            if mdl is not None and ((not full) or (full.count("```") % 2 == 1 and streamed == 0)):
+            # If the last attempt ERRORED (last is not None, e.g. the stream died
+            # mid-way), retrying the same model just re-fails, so the retry advances
+            # to the next eligible (non-cooling) step's model instead.
+            retry_mdl, retry_lab = mdl, None
+            if last is not None and mdl is not None:
+                retry_mdl = None
+                for kind2, nm2, lab2 in steps[used_idx + 1:]:
+                    if llm.model_cooling(nm2):
+                        continue
+                    try:
+                        retry_mdl = llm.build_or(nm2) if kind2 == "or" else llm.build_groq(nm2) if kind2 == "groq" else model(nm2)
+                        used_model = nm2
+                        retry_lab = lab2
+                        break
+                    except Exception:
+                        continue
+            if retry_mdl is not None and ((not full) or (full.count("```") % 2 == 1 and streamed == 0)):
                 try:
                     retry = []
-                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
+                    async for ch in retry_mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
                         if tt:
                             retry.append(tt)
                     rfull = "".join(retry).strip()
                     if rfull and rfull.count("```") % 2 == 0:
+                        if sent_label and retry_lab is not None:
+                            yield f"data: {json.dumps({'m': llm.label(retry_lab)})}\n\n"
                         full = rfull
                         out = retry
                         # Retry replaces the WHOLE answer. Anything streamed so far
@@ -265,7 +292,7 @@ async def chat(req: Request):
                 await asyncio.to_thread(memory.save_chat_turn, vid, sid, text, full)
                 asyncio.create_task(asyncio.to_thread(memory.event, vid, "model:" + str(used_model)))
         except Exception as e:  # never leak keys or internals
-            print("llm error:", type(e).__name__, str(e)[:200].replace(os.environ.get("GEMINI_API_KEY", "#"), "***"))
+            print("llm error:", type(e).__name__, llm.redact(str(e)[:400]))
             yield f"data: {json.dumps({'err': 'Crayon hit a snag talking to its brain. Please try again in a moment.'})}\n\n"
         finally:
             active["n"] = max(0, active["n"] - 1)

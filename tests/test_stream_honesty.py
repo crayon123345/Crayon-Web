@@ -41,7 +41,7 @@ def _sse_texts(resp):
 
 
 def _post(fake, monkeypatch):
-    monkeypatch.setattr(llm, "plan", lambda text: [("or", "fake", "default")])
+    monkeypatch.setattr(llm, "plan", lambda text, mail=False: [("or", "fake", "default")])
     monkeypatch.setattr(llm, "build_or", lambda nm: fake)
     monkeypatch.setattr(appmod.memory, "load_context", lambda vid: [])
     monkeypatch.setattr(appmod.memory, "save_turn", lambda *a, **k: None)
