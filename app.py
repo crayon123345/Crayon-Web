@@ -31,7 +31,7 @@ import shutil
 _S = BASE / "static"
 if not _S.exists():
     _S.mkdir()
-    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"):
+    for _n in ("index.html", "style.css", "app.js", "crayon.svg", "favicon.svg", "pyworker.js", "manifest.webmanifest", "sw.js", "privacy.html", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png", "assetlinks.json"):
         if (BASE / _n).exists():
             shutil.copy(BASE / _n, _S / _n)
 app.include_router(gmail_auth.router)
@@ -171,6 +171,7 @@ async def chat(req: Request):
 
     if active["n"] >= MAX_STREAMS:
         return JSONResponse({"error": "Crayon is busy right now. Try again in a few seconds."}, status_code=503)
+    tz = str(body.get("tz") or "")[:64]
     mail_on = False
     try:
         mail_on = bool(body.get("mail")) and gmail_auth.current_user(req) is not None
@@ -198,7 +199,7 @@ async def chat(req: Request):
                     mdl = llm.build_or(nm) if kind == "or" else model(nm)
                     used_model = nm
                     sent_label = False
-                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):
+                    async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
                         if tt:
                             if not sent_label:
