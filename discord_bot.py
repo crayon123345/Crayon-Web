@@ -74,7 +74,7 @@ def register():
                 last = None
                 for kind, nm, lab in steps:
                     try:
-                        mdl = llm.build_or(nm) if kind == "or" else llm.build_model(name=nm) if nm else llm.build_model()
+                        mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else llm.build_model(name=nm) if nm else llm.build_model()
                         async for ch in mdl.astream(llm.to_messages(hist[-32:], text)):
                             tt = llm.chunk_text(ch)
                             if tt:

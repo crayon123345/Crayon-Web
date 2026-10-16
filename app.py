@@ -195,7 +195,7 @@ async def chat(req: Request):
             last = None
             for kind, nm, lab in steps:
                 try:
-                    mdl = llm.build_or(nm) if kind == "or" else model(nm)
+                    mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else model(nm)
                     used_model = nm
                     sent_label = False
                     async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on)):

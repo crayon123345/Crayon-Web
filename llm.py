@@ -169,13 +169,32 @@ def build_or(name: str):
                       streaming=True, temperature=0.4, timeout=60, max_retries=0)
 
 
+def groq_key() -> str:
+    return os.environ.get("GROQ_API_KEY", "").strip()
+
+
+def groq_models():
+    # Free-tier model IDs verified against Groq's own rate-limits doc
+    # (console.groq.com/docs/rate-limits, fetched 2026-10-16).
+    raw = os.environ.get("CRAYON_GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def build_groq(name: str):
+    from langchain_openai import ChatOpenAI
+    return ChatOpenAI(model=name, api_key=groq_key(), base_url="https://api.groq.com/openai/v1",
+                      streaming=True, temperature=0.4, timeout=60, max_retries=0)
+
+
 def plan(text: str):
-    """Ordered list of (kind, name, label). Gemini default; code/reasoning prefers OpenRouter; OpenRouter is the 429 backup."""
+    """Ordered list of (kind, name, label). Gemini default; Groq free tier is the next fallback;
+    code/reasoning prefers OpenRouter; OpenRouter :free (tightest quota) stays last resort."""
     gem = [("gemini", n, n) for n in model_names()]
     orm = [("or", n, n) for n in code_models()] if or_key() else []
+    grq = [("groq", n, n) for n in groq_models()] if groq_key() else []
     if orm and CODE_HINT.search(text or ""):
-        return orm + gem
-    return gem + orm
+        return orm + gem + grq
+    return gem + grq + orm
 
 
 def label(name: str) -> str:
