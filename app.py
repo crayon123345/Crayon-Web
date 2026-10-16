@@ -546,6 +546,59 @@ async def fx(req: Request, pair: str = ""):
         return JSONResponse({"error": "Rates are unavailable right now."}, status_code=503)
 
 
+async def _stock_yahoo(sym):
+    """Single verified source. Returns (card, unknown): unknown=True means yahoo
+    definitively has no such ticker (HTTP 404, empty result, wrong/mismatched
+    instrument, unusable price) - NOT an outage. Raises on outage, including a
+    stale or missing quote timestamp (review 2026-10-15 v2).
+
+    Fallback history: stooq's q/l CSV endpoint is removed and q/d/l sits behind
+    a JS anti-bot check (verified live); CNBC's free JSON works but its market
+    data terms are internal-use-only / no republication, so it cannot back a
+    public site. Until a source with permitting terms is wired in, an outage is
+    answered honestly with 503."""
+    import datetime as _dt
+    import math as _math
+    async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
+        r = await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})
+        if r.status_code == 404:
+            return None, True
+        r.raise_for_status()
+        j = r.json()
+    res = (j.get("chart") or {}).get("result") or []
+    if not res:
+        return None, True
+    meta = res[0].get("meta", {})
+    # Binding: the instrument returned must be the one asked for, a
+    # stock-like security, on a named exchange with a named currency.
+    if str(meta.get("symbol", "")).upper() != sym:
+        return None, True
+    if meta.get("instrumentType") not in ("EQUITY", "ETF", "INDEX", "MUTUALFUND"):
+        return None, True
+    if not meta.get("currency") or not (meta.get("fullExchangeName") or meta.get("exchangeName")):
+        return None, True
+    price = meta.get("regularMarketPrice")
+    if not isinstance(price, (int, float)) or isinstance(price, bool) or not _math.isfinite(price) or price <= 0:
+        return None, True
+    ts = meta.get("regularMarketTime")
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    if not isinstance(ts, (int, float)) or not (now - 45 * 86400) < ts < now + 86400:
+        raise ValueError("stale or missing quote timestamp")
+    tzname = meta.get("exchangeTimezoneName") or ""
+    off = meta.get("gmtoffset")
+    if isinstance(off, (int, float)) and tzname:
+        when = _dt.datetime.utcfromtimestamp(ts + off).strftime("%Y-%m-%d %H:%M") + " " + tzname
+    else:
+        when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC")
+    prev = meta.get("chartPreviousClose")
+    if not isinstance(prev, (int, float)) or isinstance(prev, bool) or not _math.isfinite(prev) or prev <= 0:
+        prev = None  # never let a NaN/Inf close reach the JSON encoder or the card
+    return {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
+            "price": price, "prev": prev, "currency": meta.get("currency", ""),
+            "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
+            "date": when, "delayed": True, "source": "yahoo finance"}, False
+
+
 @app.get("/api/stock")
 async def stock(req: Request, sym: str = ""):
     import re as _re
@@ -559,27 +612,14 @@ async def stock(req: Request, sym: str = ""):
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     try:
-        import datetime as _dt
-        async with httpx.AsyncClient(timeout=10, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}) as c:
-            j = (await c.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": "1d"})).json()
-        res = (j.get("chart") or {}).get("result") or []
-        if not res:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        meta = res[0].get("meta", {})
-        price = meta.get("regularMarketPrice")
-        if price is None:
-            return JSONResponse({"error": "Unknown ticker."}, status_code=404)
-        ts = meta.get("regularMarketTime")
-        when = _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
-        out = {"symbol": meta.get("symbol", sym), "name": meta.get("shortName") or meta.get("longName") or "",
-                "price": price, "prev": meta.get("chartPreviousClose"), "currency": meta.get("currency", ""),
-                "exchange": meta.get("fullExchangeName") or meta.get("exchangeName") or "",
-                "date": when, "source": "yahoo finance"}
-        _stcache[sym] = (time.time(), out)
-        return out
+        card, unknown = await _stock_yahoo(sym)
     except Exception as e:
-        print("stock:", type(e).__name__)
+        print("stock yahoo:", type(e).__name__)
         return JSONResponse({"error": "Quotes are unavailable right now."}, status_code=503)
+    if card is None:
+        return JSONResponse({"error": "Unknown ticker."}, status_code=404)
+    _stcache[sym] = (time.time(), card)
+    return card
 
 
 @app.get("/api/image")
