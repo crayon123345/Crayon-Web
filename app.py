@@ -42,14 +42,35 @@ app.include_router(twilio_wa.router)
 app.include_router(d360_wa.router)
 app.include_router(voice.router)
 keystore.load_into_env()
-if os.environ.get("NEON_DATABASE_URL"):
-    try:
-        import psycopg
-        psycopg.connect(os.environ["NEON_DATABASE_URL"], connect_timeout=8).close()
-        gmail_auth._DB = os.environ["NEON_DATABASE_URL"]
-        gmail_auth._ready = False
-    except Exception as e:
-        print("neon boot check failed, staying on DATABASE_URL:", type(e).__name__)
+def _boot_db():
+    """Cold-start DB resilience. Neon is the system of record: verify it answers at
+    boot. If the URL we would run on is unreachable, degrade to ephemeral local
+    sqlite (no persistence this boot) instead of leaving every request to hang on
+    8s connect timeouts against a dead URL. Never silently repoints to the legacy
+    DATABASE_URL: after the one-time migration it is stale, and writing to it would
+    diverge from Neon. The next boot re-tries Postgres, so the degrade self-heals."""
+    if os.environ.get("NEON_DATABASE_URL"):
+        try:
+            import psycopg
+            psycopg.connect(os.environ["NEON_DATABASE_URL"], connect_timeout=8).close()
+            gmail_auth._DB = os.environ["NEON_DATABASE_URL"]
+            gmail_auth._ready = False
+        except Exception as e:
+            print("neon boot check failed, degrading to ephemeral local sqlite (no persistence this boot):", type(e).__name__)
+            gmail_auth._DB = ""
+            gmail_auth._ready = False
+        return
+    if gmail_auth._DB.startswith("postgres"):
+        try:
+            import psycopg
+            psycopg.connect(gmail_auth._DB, connect_timeout=8).close()
+        except Exception as e:
+            print("db boot check failed, degrading to ephemeral local sqlite (no persistence this boot):", type(e).__name__)
+            gmail_auth._DB = ""
+            gmail_auth._ready = False
+
+
+_boot_db()
 gmail_auth.migrate_if_needed()
 import threading
 threading.Thread(target=lambda: telegram_bot.register() if telegram_bot.token() else None, daemon=True).start()
@@ -144,7 +165,16 @@ def assetlinks():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "provider": llm.provider()}
+    neon = os.environ.get("NEON_DATABASE_URL", "")
+    d = gmail_auth._DB
+    return {"ok": True,
+            "provider": llm.provider(),
+            # Providers with a configured key, not a live reachability verdict.
+            "providers": [n for n, k in (("gemini", "GEMINI_API_KEY"), ("groq", "GROQ_API_KEY"),
+                                         ("openrouter", "OPENROUTER_API_KEY")) if os.environ.get(k)],
+            # Which store requests will actually use; "sqlite" after a boot-time
+            # degrade means Postgres was unreachable and nothing persists this boot.
+            "db": "neon" if d and d == neon else "postgres" if d.startswith("postgres") else "sqlite"}
 
 
 @app.post("/api/chat")
@@ -229,7 +259,20 @@ async def chat(req: Request):
                     print("model fail:", kind, nm, type(e2).__name__)
                     if llm.hard_model_error(e2):
                         llm.mark_model_bad(nm)
+                    if out and not streamed:
+                        # The connection died before anything reached the page (the
+                        # partial buffer is fence-holdback only): drop it and try the
+                        # next provider for a complete answer.
+                        out = []
+                        continue
                     if out:
+                        if streamed:
+                            # A partial answer is already on the page and cannot be
+                            # unsent: keep it, but say honestly that it was cut off.
+                            note = "\n\n*(answer cut short - the model connection dropped mid-reply; say \"continue\" and I'll finish it)*"
+                            out.append(note)
+                            yield f"data: {json.dumps({'t': note})}\n\n"
+                            streamed += len(note)
                         break
             if last is not None and not out:
                 raise last
