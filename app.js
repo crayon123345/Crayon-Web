@@ -297,21 +297,36 @@
     setBusy(true); stopped = false; pinned = true; stick(true);
     if (agentMode) planBox = null;
     let msg = text;
+    let planStalls = 0;
     let finalAcc = '';
     const TCAP = agentMode ? 8 : 5;
     for (let step = 0; step < TCAP + 1; step++) {
       const bub = add('ai', '<span class="think">Thinking</span>');
       startThink(bub);
-      const acc = await stream(msg, bub);
+      let acc = await stream(msg, bub);
       stopThink(bub);
       if (acc !== null) finalAcc = acc;
       if (acc === null || stopped) break;
-      const pm = agentMode && acc.match(/```plan\n([\s\S]*?)```/);
+      const pm = agentMode && acc.match(/```plan\s*\n([\s\S]*?)```/);
       if (pm) {
-        const rest = acc.replace(pm[0], '').trim(); if (rest) bub.innerHTML = md(rest); else bub.parentElement.remove();
+        // Show/update the plan card, then KEEP PROCESSING the same reply.
+        // Agent rhythm: progress line + re-emitted plan + the next tool block
+        // arrive in ONE reply (one round trip per step). The old flow stopped
+        // at the plan and silently dropped any tool block that came with it -
+        // the live "plan shown, then nothing" failure (2026-10-15).
+        acc = acc.replace(pm[0], '').trim();
         planCard(pm[1]);
-        msg = '[Plan shown]';
-        continue;
+        if (!/```(gmail|web-fetch|weather|fx|stock|web-search|image-gen|python-run)\s*\n/.test(acc)) {
+          planStalls += 1;
+          if (planStalls > 2) {
+            bub.innerHTML = md((acc ? acc + '\n\n' : '') + '_Plan stalled - ask me to continue and I will pick it back up._');
+            break;
+          }
+          if (acc) bub.innerHTML = md(acc); else bub.parentElement.remove();
+          msg = '[Plan shown - start executing now: one short progress line, re-emit the plan with finished steps marked [x] and the next step prefixed -> , then exactly one tool block for that step - all in one reply. Never reply with only a plan block.]';
+          continue;
+        }
+        // Fall through with the plan stripped: the tool block below still runs.
       }
       const gm = signedIn && acc.match(/```gmail\n([\s\S]*?)```/);
       if (gm && step < TCAP) {
