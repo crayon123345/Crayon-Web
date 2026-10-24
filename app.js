@@ -865,18 +865,27 @@
         if (maxAbs < 0.00001) {
           toast('Mic audio is not reaching Crayon - switching to basic voice mode.');
           stopLive();
-          live = true; liveBtn.classList.add('listening');
           startSrLive();
           return;
         }
       }
       if (liveWs && liveWs.readyState === 1) liveWs.send(JSON.stringify({audio: b64pcm(downsample(d, inRate, 16000))}));
     };
-    src.connect(liveNode); liveNode.connect(liveCtx.destination);
+    // Tap the mic chain through a zero-gain node: connecting the script
+    // processor straight to the destination plays the mic back through the
+    // phone's speaker (feedback/echo), which can also drown Crayon's reply.
+    const tap = liveCtx.createGain(); tap.gain.value = 0;
+    src.connect(liveNode); liveNode.connect(tap); tap.connect(liveCtx.destination);
     toast('Gemini Live on - just talk. Tap the same button to stop.');
   }
   function startSrLive() {
-    if (!SR) { toast('Live voice is not available in this browser.'); live = false; return; }
+    // Self-arming: every caller reaches here AFTER stopLive() has cleared the
+    // live flag (the Gemini Live onerror/onclose paths used to call
+    // stopLive(); startSrLive() without re-arming - the recognition loop then
+    // exited on its first `if (!live) return` and live voice died silently.
+    // Matches his Android report: "not hearing").
+    if (!SR) { toast('Live voice is not available in this browser.'); live = false; liveBtn.classList.remove('listening'); return; }
+    live = true; liveBtn.classList.add('listening');
     toast('Live mode on (basic) - just talk.');
     (function loop() {
       if (!live) return;
@@ -900,7 +909,7 @@
     live = true; liveBtn.classList.add('listening');
     startGeminiLive().catch((e) => {
       if (micError(e)) { stopLive(); return; }
-      if (live) { stopLive(); live = true; liveBtn.classList.add('listening'); startSrLive(); }
+      if (live) { stopLive(); startSrLive(); }
     });
   });
 
