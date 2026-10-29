@@ -192,6 +192,7 @@ async def chat(req: Request):
         active["n"] += 1
         try:
             used_model = None
+            used_kind = None
             steps = llm.plan(text, mail=mail_on) if llm.provider() == "gemini" else [("gemini", None, "default")]
             last = None
             mdl = None
@@ -201,10 +202,14 @@ async def chat(req: Request):
                     mdl = llm.build_or(nm) if kind == "or" else llm.build_groq(nm) if kind == "groq" else model(nm)
                     used_model = nm
                     used_idx = si
+                    used_kind = kind
+                    strip = llm.ThinkStripper() if kind == "groq" else None
                     sent_label = False
                     streamed = 0  # chars of joined output already sent to the client
                     async for ch in mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
+                        if strip:
+                            tt = strip.feed(tt)
                         if tt:
                             if not sent_label:
                                 sent_label = True
@@ -217,6 +222,13 @@ async def chat(req: Request):
                             if safe > streamed:
                                 yield f"data: {json.dumps({'t': buf[streamed:safe]})}\n\n"
                                 streamed = safe
+                    if strip:
+                        tail = strip.flush()
+                        if tail:
+                            if not sent_label:
+                                sent_label = True
+                                yield f"data: {json.dumps({'m': llm.label(lab)})}\n\n"
+                            out.append(tail)
                     if not out and si < len(steps) - 1:
                         # Empty stream: fall through to the next provider rather than
                         # retrying a silently-failing one. On the LAST step there is no
@@ -252,6 +264,7 @@ async def chat(req: Request):
                     try:
                         retry_mdl = llm.build_or(nm2) if kind2 == "or" else llm.build_groq(nm2) if kind2 == "groq" else model(nm2)
                         used_model = nm2
+                        used_kind = kind2
                         retry_lab = lab2
                         break
                     except Exception:
@@ -259,10 +272,15 @@ async def chat(req: Request):
             if retry_mdl is not None and ((not full) or (full.count("```") % 2 == 1 and streamed == 0)):
                 try:
                     retry = []
+                    rstrip = llm.ThinkStripper() if used_kind == "groq" else None
                     async for ch in retry_mdl.astream(llm.to_messages(hist[-MAX_TURNS * 2:], text, mail_on, agent_on, tz)):
                         tt = llm.chunk_text(ch)
+                        if rstrip:
+                            tt = rstrip.feed(tt)
                         if tt:
                             retry.append(tt)
+                    if rstrip:
+                        retry.append(rstrip.flush())
                     rfull = "".join(retry).strip()
                     if rfull and rfull.count("```") % 2 == 0:
                         if sent_label and retry_lab is not None:

@@ -192,11 +192,24 @@ def groq_key() -> str:
     return os.environ.get("GROQ_API_KEY", "").strip()
 
 
-def groq_models():
+def groq_models(reasoning_first: bool = False):
     # Free-tier model IDs verified against Groq's own rate-limits doc
-    # (console.groq.com/docs/rate-limits, fetched 2026-10-16).
-    raw = os.environ.get("CRAYON_GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.8-27b")
-    return [x.strip() for x in raw.split(",") if x.strip()]
+    # (console.groq.com/docs/rate-limits, first fetched 2026-10-16).
+    # deepseek-r1-distill-llama-70b (DeepSeek R1 reasoning distilled into Llama-70B,
+    # ~30 rpm / 1,000 req/day free) re-verified on the docs page 2026-10-29. It streams
+    # <think>...</think> reasoning before the answer, which app.py strips via ThinkStripper.
+    # It joins the DEFAULT Groq chain only: an explicit CRAYON_GROQ_MODELS is kept exact
+    # (deepseek then needs CRAYON_GROQ_DEEPSEEK set explicitly; "" disables it either way).
+    raw = os.environ.get("CRAYON_GROQ_MODELS")
+    if raw is not None:
+        names = [x.strip() for x in raw.split(",") if x.strip()]
+        ds = os.environ.get("CRAYON_GROQ_DEEPSEEK", "").strip()
+    else:
+        names = [x.strip() for x in "openai/gpt-oss-120b,qwen/qwen3.8-27b".split(",")]
+        ds = os.environ.get("CRAYON_GROQ_DEEPSEEK", "deepseek-r1-distill-llama-70b").strip()
+    if not ds:
+        return names
+    return ([ds] + names) if reasoning_first else (names + [ds])
 
 
 def build_groq(name: str):
@@ -254,12 +267,54 @@ def plan(text: str, mail: bool = False):
     third-party processor the owner has not approved for mail. Models in cooldown are skipped."""
     gem = [("gemini", n, n) for n in model_names()]
     orm = [("or", n, n) for n in code_models()] if or_key() else []
-    grq = [] if mail else [("groq", n, n) for n in groq_models()] if groq_key() else []
+    grq = [] if mail else [("groq", n, n) for n in groq_models(bool(CODE_HINT.search(text or "")))] if groq_key() else []
     if orm and CODE_HINT.search(text or ""):
         steps = orm + gem + grq
     else:
         steps = gem + grq + orm
     return [s for s in steps if not model_cooling(s[1])]
+
+
+class ThinkStripper:
+    """Streaming filter that drops <think>...</think> reasoning blocks emitted by
+    DeepSeek-R1-Distill models, so only the final answer reaches the visitor."""
+
+    def __init__(self):
+        self.mode = "decide"   # decide -> thinking | plain
+        self.buf = ""
+
+    def feed(self, s: str) -> str:
+        self.buf += s
+        if self.mode == "decide":
+            self.buf = self.buf.lstrip()
+            if not self.buf:
+                return ""
+            if self.buf.startswith("<think>"):
+                self.buf = self.buf[7:]
+                self.mode = "thinking"
+            elif "<think>".startswith(self.buf):
+                return ""  # still ambiguous, wait for more
+            else:
+                self.mode = "plain"
+        if self.mode == "thinking":
+            j = self.buf.find("</think>")
+            if j == -1:
+                if len(self.buf) > 8:
+                    self.buf = self.buf[-8:]
+                return ""
+            self.buf = self.buf[j + 8:]
+            self.mode = "plain"
+        out, self.buf = self.buf, ""
+        return out
+
+    def flush(self) -> str:
+        """End of stream: held-back text in 'decide'/'plain' was real answer text;
+        an unterminated think block is dropped (it was reasoning, not an answer)."""
+        if self.mode == "thinking":
+            self.buf = ""
+        out, self.buf = self.buf, ""
+        self.mode = "plain"
+        return out
 
 
 def label(name: str) -> str:
